@@ -78,10 +78,17 @@ class TestRuleRouterPipeline:
 
 
 class TestMetricSinkPipeline:
-    def test_sinks_written(self):
+    def test_sinks_partial_until_slots_accept(self):
+        # 种子数据里只有 SINK-0002 处于「写入中」，其余槽位不接受提交
         r = run_metric_sink_pipeline()
         assert r["sink_count"] == 4
-        assert all(s["写入状态"] == "成功" for s in r["sinks"])
+        assert r["执行状态"] == "未齐"
+        ok = [s for s in r["sinks"] if s["写入状态"] == "成功"]
+        assert [s["指标编号"] for s in ok] == ["METR-GMV"]
+        # 未确认槽位不能显示成功，也不给出读数
+        for s in r["sinks"]:
+            if s["写入状态"] != "成功":
+                assert s["值"] is None and s["写入时间"] is None
 
     def test_pipeline_result_written(self):
         run_metric_sink_pipeline()

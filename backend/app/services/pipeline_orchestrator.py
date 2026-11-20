@@ -14,7 +14,10 @@ from app.fixtures import (
     RULE_TRIGGERS, METRIC_DEFS, QUALITY_SAMPLES,
     PARTITION_STATS, EVENT_ROUTES,
 )
+from app.services.sink_writer import SinkWriterService
 from app.store import store
+
+_sink_service = SinkWriterService()
 
 
 def _to_float(v: Any) -> float:
@@ -125,19 +128,156 @@ def run_rule_router_pipeline() -> dict:
 
 
 # Pipeline 4: metric_calc -> pipeline_orch -> sink_writer
-def run_metric_sink_pipeline() -> dict:
-    """指标结果写入下游 sink。"""
-    # 先跑 window_metric 拿到指标
-    wm = run_window_metric_pipeline()
-    metrics = wm.get("metrics", {})
+#
+# 指标落盘按批次执行：批次内每个落盘值都有对应目标槽位的提交回执，
+# 槽位写入结果回写到执行清单（_metric_sink_manifest）。批次执行状态
+# 只在全部槽位回执齐备后从「未齐」推进到「完成」；写入中断后只能
+# 接着处理未确认槽位，已确认槽位沿用历史批次读数，绝不重复提交。
+MANIFEST_TABLE = "_metric_sink_manifest"
+BATCH_INCOMPLETE = "未齐"
+BATCH_COMPLETE = "完成"
 
+
+def _assigned_slot_codes(metric_ids: list[str]) -> list[str]:
+    """按槽位编号顺序为每个指标分配目标槽位（槽位不足时循环复用）。"""
+    rows = sorted(store.rows("sink_writer"), key=lambda r: int(r.get("id", 0)))
+    codes = [str(r.get("槽位编号")) for r in rows]
+    if not codes:
+        raise ValueError("数据落盘模块没有可用的输出槽位")
+    return [codes[i % len(codes)] for i in range(len(metric_ids))]
+
+
+def _open_sink_batch(metric_ids: list[str]) -> dict:
+    manifests = store.rows(MANIFEST_TABLE)
+    seq = max((int(m.get("batch_seq", 0)) for m in manifests), default=0) + 1
+    manifest = {
+        "batch_id": f"MSB-{seq:04d}",
+        "batch_seq": seq,
+        "执行状态": BATCH_INCOMPLETE,
+        "slots": [
+            {"槽位编号": code, "指标编号": mid, "status": "待写入",
+             "receipt_id": None, "失败原因": None, "committed_at": None,
+             "attempts": 0, "最近尝试值": None}
+            for mid, code in zip(metric_ids, _assigned_slot_codes(metric_ids))
+        ],
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    manifests.append(manifest)
+    return manifest
+
+
+def _find_manifest(batch_id: str) -> dict | None:
+    for m in store.rows(MANIFEST_TABLE):
+        if m.get("batch_id") == batch_id:
+            return m
+    return None
+
+
+def _latest_incomplete_manifest(metric_key: set[str]) -> dict | None:
+    for m in reversed(store.rows(MANIFEST_TABLE)):
+        if m.get("执行状态") == BATCH_INCOMPLETE and {s["指标编号"] for s in m["slots"]} == metric_key:
+            return m
+    return None
+
+
+def _execute_sink_batch(manifest: dict, metrics: dict, fail_slots: set[str]) -> dict:
+    """按执行清单提交未确认槽位，并把每个槽位的写入结果回写清单。
+
+    已确认槽位直接沿用历史回执读数，不再触碰目标槽位；未确认槽位
+    逐个补写，成功即登记回执，失败则记录原因等待下一轮补写。
+    """
+    newly: list[str] = []
+    carried: list[str] = []
     sinks: list[dict] = []
-    for mid, val in metrics.items():
-        sinks.append({"指标编号": mid, "值": val, "写入时间": datetime.now().isoformat(), "写入状态": "成功"})
+    for slot in manifest["slots"]:
+        mid, code = slot["指标编号"], slot["槽位编号"]
+        if slot["status"] == "已确认":
+            receipt = _sink_service.find_slot_receipt(manifest["batch_id"], code, mid)
+            sinks.append({"指标编号": mid, "槽位编号": code, "值": receipt["值"],
+                          "写入时间": receipt["committed_at"], "写入状态": "成功",
+                          "来源": "历史回执", "失败原因": None})
+            carried.append(code)
+            continue
+        value = metrics.get(mid)
+        slot["attempts"] += 1
+        slot["最近尝试值"] = value
+        receipt, err = _sink_service.commit_slot_value(
+            batch_id=manifest["batch_id"], slot_id=code, metric_id=mid,
+            value=value, force_fail=code in fail_slots)
+        if receipt is not None:
+            slot.update(status="已确认", receipt_id=receipt["receipt_id"],
+                        committed_at=receipt["committed_at"], 失败原因=None)
+            sinks.append({"指标编号": mid, "槽位编号": code, "值": receipt["值"],
+                          "写入时间": receipt["committed_at"], "写入状态": "成功",
+                          "来源": "本轮写入", "失败原因": None})
+            newly.append(code)
+        else:
+            slot.update(status="写入失败", 失败原因=err)
+            sinks.append({"指标编号": mid, "槽位编号": code, "值": None,
+                          "写入时间": None, "写入状态": "失败",
+                          "来源": None, "失败原因": err})
+    if all(s["status"] == "已确认" for s in manifest["slots"]):
+        manifest["执行状态"] = BATCH_COMPLETE
+    manifest["updated_at"] = datetime.now().isoformat()
+    return {
+        "batch_id": manifest["batch_id"],
+        "batch_seq": manifest["batch_seq"],
+        "执行状态": manifest["执行状态"],
+        "sink_count": len(sinks),
+        "confirmed_count": sum(1 for s in sinks if s["写入状态"] == "成功"),
+        "pending_count": sum(1 for s in sinks if s["写入状态"] != "成功"),
+        "sinks": sinks,
+        "本轮切换槽位": list(dict.fromkeys(newly)),
+        "沿用历史槽位": list(dict.fromkeys(carried)),
+        "待补写槽位": list(dict.fromkeys(
+            s["槽位编号"] for s in manifest["slots"] if s["status"] != "已确认")),
+    }
 
-    result = {"sink_count": len(sinks), "sinks": sinks}
+
+def _known_metric_ids() -> list[str]:
+    return [m["指标编号"] for m in METRIC_DEFS]
+
+
+def run_metric_sink_pipeline(
+    metric_ids: list[str] | None = None,
+    fail_slots: set[str] | None = None,
+) -> dict:
+    """指标结果写入下游槽位：批次内每个落盘值都有目标槽位提交回执。
+
+    存在同口径的未齐批次时接着处理未确认槽位（补写），
+    上一批次回执齐备后才开启新批次。
+    """
+    metrics = run_window_metric_pipeline().get("metrics", {})
+    known = _known_metric_ids()
+    wanted = [mid for mid in (metric_ids or known) if mid in known]
+    if not wanted:
+        raise ValueError("没有可落盘的指标")
+    manifest = _latest_incomplete_manifest(set(wanted))
+    if manifest is None:
+        manifest = _open_sink_batch(wanted)
+    result = _execute_sink_batch(manifest, metrics, fail_slots or set())
     _wr("metric_pipeline_sink", {"source": ["metric_calc", "pipeline_orch"], "target": "sink_writer", "payload": result})
     return result
+
+
+def resume_metric_sink_batch(batch_id: str, fail_slots: set[str] | None = None) -> dict | None:
+    """补写指定批次：只处理未确认槽位；重复到达的补写请求幂等，已确认数据不重复。"""
+    manifest = _find_manifest(batch_id)
+    if manifest is None:
+        return None
+    metrics = run_window_metric_pipeline().get("metrics", {})
+    result = _execute_sink_batch(manifest, metrics, fail_slots or set())
+    _wr("metric_pipeline_sink", {"source": ["metric_calc", "pipeline_orch"], "target": "sink_writer", "payload": result})
+    return result
+
+
+def list_metric_sink_batches() -> list[dict]:
+    """执行清单：各批次的槽位确认进度，供排查与补写决策。"""
+    return [
+        {**m, "slots": [dict(s) for s in m["slots"]]}
+        for m in store.rows(MANIFEST_TABLE)
+    ]
 
 
 # Pipeline 5: data_quality -> pipeline_orch
